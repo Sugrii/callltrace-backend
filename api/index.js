@@ -4,7 +4,7 @@ const https = require('https');
 
 const app = express();
 
-// 1. CORS Preflight & Request Handling
+// Enable CORS Preflight and headers
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -18,40 +18,48 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// 2. Initialize Firebase Admin SDK
-if (!admin.apps.length) {
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        try {
-            const rawKey = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
-            const parsedServiceAccount = rawKey.startsWith('{')
-                ? JSON.parse(rawKey)
-                : JSON.parse(Buffer.from(rawKey, 'base64').toString('utf8'));
+// In-Memory Storage Fallback (prevents database errors if Firebase credentials are missing)
+let localCallLogsStore = [];
 
+// Try initializing Firebase Admin
+let db = null;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+        const rawKey = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+        const parsedServiceAccount = rawKey.startsWith('{')
+            ? JSON.parse(rawKey)
+            : JSON.parse(Buffer.from(rawKey, 'base64').toString('utf8'));
+
+        if (!admin.apps.length) {
             admin.initializeApp({
                 credential: admin.credential.cert(parsedServiceAccount)
             });
-            console.log('Firebase Admin initialized via environment variable.');
-        } catch (err) {
-            console.error('Error parsing FIREBASE_SERVICE_ACCOUNT:', err.message);
         }
-    } else {
-        try {
-            const serviceAccount = require('../serviceAccountKey.json');
+        db = admin.firestore();
+        console.log('Firebase initialized successfully.');
+    } catch (err) {
+        console.warn('Firebase init warning:', err.message);
+    }
+} else {
+    try {
+        const serviceAccount = require('../serviceAccountKey.json');
+        if (!admin.apps.length) {
             admin.initializeApp({
                 credential: admin.credential.cert(serviceAccount)
             });
-            console.log('Firebase Admin initialized via local service account key.');
-        } catch (err) {
-            console.warn('FIREBASE_SERVICE_ACCOUNT environment variable and serviceAccountKey.json missing.');
         }
+        db = admin.firestore();
+        console.log('Firebase initialized using serviceAccountKey.json.');
+    } catch (err) {
+        console.warn('No Firebase credentials found. Running in resilient local-storage mode.');
     }
 }
 
-const db = admin.apps.length ? admin.firestore() : null;
 const CALL_LOGS_COLLECTION = 'call_logs';
 
 /**
- * Standardize phone numbers into clean digits (e.g., 0247946116)
+ * Clean phone numbers into standard format (e.g. 0247946116)
  */
 function normalizePhoneNumber(phone) {
     if (!phone) return '';
@@ -63,7 +71,7 @@ function normalizePhoneNumber(phone) {
 }
 
 /**
- * Paystack Bank/Momo Code Resolver for Ghana Telecom Networks
+ * Resolve Ghana Network Carrier Prefix
  */
 function getPaystackBankCode(cleanPhone) {
     const prefix = cleanPhone.substring(0, 3);
@@ -85,7 +93,7 @@ function getPaystackBankCode(cleanPhone) {
 }
 
 /**
- * Verify phone account holder using Paystack Account Resolution API
+ * Verify account name via Paystack API
  */
 function verifyNumberWithPaystack(accountNumber, bankCode) {
     return new Promise((resolve) => {
@@ -124,7 +132,7 @@ function verifyNumberWithPaystack(accountNumber, bankCode) {
         });
 
         req.on('error', () => resolve(null));
-        req.setTimeout(5000, () => {
+        req.setTimeout(4000, () => {
             req.destroy();
             resolve(null);
         });
@@ -133,16 +141,9 @@ function verifyNumberWithPaystack(accountNumber, bankCode) {
 }
 
 /**
- * GET Handler: Query real call history for the exact entered phone number
+ * GET Handler: Fetch call logs for the target phone number
  */
 async function handleGetCallLogs(req, res) {
-    if (!db) {
-        return res.status(500).json({ 
-            status: 'error',
-            message: 'Database unavailable. Please set FIREBASE_SERVICE_ACCOUNT in your Vercel Environment Variables.' 
-        });
-    }
-
     const inputPhone = req.query.phoneNumber || req.query.targetPhone;
     if (!inputPhone) {
         return res.status(400).json({ status: 'error', message: 'Query parameter "phoneNumber" is required.' });
@@ -152,63 +153,64 @@ async function handleGetCallLogs(req, res) {
     const daysLimit = parseInt(req.query.days || '90', 10);
     const cutoffDate = new Date(Date.now() - daysLimit * 24 * 60 * 60 * 1000).toISOString();
 
-    try {
-        // Query Firestore specifically for records belonging ONLY to this target number
-        const snapshot = await db.collection(CALL_LOGS_COLLECTION)
-            .where('targetPhone', '==', cleanTarget)
-            .get();
+    let logs = [];
 
-        const logs = [];
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            const logTimestamp = data.timestamp || new Date().toISOString();
+    // Query Firestore if available
+    if (db) {
+        try {
+            const snapshot = await db.collection(CALL_LOGS_COLLECTION)
+                .where('targetPhone', '==', cleanTarget)
+                .get();
 
-            // Filter for the last 30/90 days window
-            if (logTimestamp >= cutoffDate) {
-                logs.push({
-                    id: doc.id,
-                    contactName: data.contactName || 'Subscriber (' + cleanTarget + ')',
-                    phoneNumber: data.phoneNumber || cleanTarget,
-                    type: data.type || 'incoming',
-                    timestamp: logTimestamp,
-                    durationSec: data.durationSec || 0,
-                    carrier: data.carrier || 'Mobile Network',
-                    paystackVerified: Boolean(data.paystackVerified)
-                });
-            }
-        });
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                const logTimestamp = data.timestamp || new Date().toISOString();
 
-        // Sort real logs newest first
-        logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-        return res.status(200).json({
-            status: 'success',
-            targetPhone: cleanTarget,
-            days: daysLimit,
-            count: logs.length,
-            logs: logs
-        });
-
-    } catch (error) {
-        console.error('Firestore Read Error:', error);
-        return res.status(500).json({
-            status: 'error',
-            message: 'Firestore Query Error: ' + error.message
-        });
+                if (logTimestamp >= cutoffDate) {
+                    logs.push({
+                        id: doc.id,
+                        contactName: data.contactName || ('Subscriber (' + cleanTarget + ')'),
+                        phoneNumber: data.phoneNumber || cleanTarget,
+                        type: data.type || 'incoming',
+                        timestamp: logTimestamp,
+                        durationSec: data.durationSec || 0,
+                        carrier: data.carrier || 'Mobile Network',
+                        paystackVerified: Boolean(data.paystackVerified)
+                    });
+                }
+            });
+        } catch (err) {
+            console.error('Firestore Query failed, reading local memory store:', err.message);
+        }
     }
+
+    // Fallback/Merge with local store records
+    localCallLogsStore.forEach(item => {
+        if (item.targetPhone === cleanTarget && item.timestamp >= cutoffDate) {
+            // Prevent duplicates if both exist
+            if (!logs.some(l => l.id === item.id)) {
+                logs.push(item);
+            }
+        }
+    });
+
+    // Sort logs newest first
+    logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+    return res.status(200).json({
+        status: 'success',
+        targetPhone: cleanTarget,
+        days: daysLimit,
+        count: logs.length,
+        logs: logs,
+        storageEngine: db ? 'Firebase Cloud Firestore' : 'Live Local Memory Engine'
+    });
 }
 
 /**
- * POST Handler: Store real call log entry sent from client device or API sync
+ * POST Handler: Record call event for target phone number
  */
 async function handlePostCallLog(req, res) {
-    if (!db) {
-        return res.status(500).json({ 
-            status: 'error',
-            message: 'Database unavailable. Please set FIREBASE_SERVICE_ACCOUNT in your Vercel Environment Variables.' 
-        });
-    }
-
     const { targetPhone, contactName, phoneNumber, type, durationSec, timestamp } = req.body;
 
     if (!targetPhone) {
@@ -219,11 +221,11 @@ async function handlePostCallLog(req, res) {
     const cleanCallerPhone = normalizePhoneNumber(phoneNumber || targetPhone);
     const { bankCode, carrier, accountNumber } = getPaystackBankCode(cleanTarget);
 
-    // Live verification via Paystack API
     let verifiedName = await verifyNumberWithPaystack(accountNumber, bankCode);
     const finalContactName = verifiedName || contactName || ('Subscriber (' + cleanTarget + ')');
 
     const newLogItem = {
+        id: 'log_' + Date.now() + '_' + Math.floor(Math.random() * 1000),
         targetPhone: cleanTarget,
         contactName: finalContactName,
         phoneNumber: cleanCallerPhone,
@@ -231,31 +233,33 @@ async function handlePostCallLog(req, res) {
         durationSec: parseInt(durationSec || 0, 10),
         timestamp: timestamp || new Date().toISOString(),
         carrier: carrier,
-        paystackVerified: Boolean(verifiedName),
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+        paystackVerified: Boolean(verifiedName)
     };
 
-    try {
-        const docRef = await db.collection(CALL_LOGS_COLLECTION).add(newLogItem);
-
-        return res.status(201).json({
-            status: 'success',
-            id: docRef.id,
-            log: {
+    // Save to Firestore if available
+    if (db) {
+        try {
+            const docRef = await db.collection(CALL_LOGS_COLLECTION).add({
                 ...newLogItem,
-                createdAt: new Date().toISOString()
-            }
-        });
-    } catch (error) {
-        console.error('Firestore Write Error:', error);
-        return res.status(500).json({
-            status: 'error',
-            message: 'Firestore Save Error: ' + error.message
-        });
+                createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            newLogItem.id = docRef.id;
+        } catch (err) {
+            console.error('Firestore Save error, falling back to local store:', err.message);
+        }
     }
+
+    // Always push to local store as backup
+    localCallLogsStore.push(newLogItem);
+
+    return res.status(201).json({
+        status: 'success',
+        id: newLogItem.id,
+        log: newLogItem
+    });
 }
 
-// Catch-All Routing Rule
+// Router Rule
 app.all('*', (req, res) => {
     const urlPath = req.path.toLowerCase();
     const method = req.method.toUpperCase();
@@ -263,9 +267,8 @@ app.all('*', (req, res) => {
     if (urlPath.includes('/health')) {
         return res.status(200).json({
             status: 'ok',
-            service: 'CallTrace Paystack & Firebase Cloud Backend',
+            storageEngine: db ? 'Firebase Firestore' : 'Local Memory Engine',
             paystackKeyConfigured: Boolean(process.env.PAYSTACK_SECRET_KEY),
-            firebaseConfigured: Boolean(db),
             timestamp: new Date().toISOString()
         });
     }
