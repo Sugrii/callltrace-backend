@@ -4,9 +4,9 @@ const admin = require('firebase-admin');
 
 const app = express();
 
-// Enable CORS for frontend web requests
+const cors = require('cors');
+// Allow requests from any origin (or specify your GitHub Pages URL)
 app.use(cors({ origin: true }));
-app.use(express.json());
 
 // Initialize Firebase Admin SDK
 // Supports both Environment Variables (Vercel Production) and local JSON file fallback
