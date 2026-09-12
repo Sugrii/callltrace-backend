@@ -30,7 +30,7 @@ if (!admin.apps.length) {
             admin.initializeApp({
                 credential: admin.credential.cert(parsedServiceAccount)
             });
-            console.log('Firebase initialized via environment variable.');
+            console.log('Firebase Admin initialized via environment variable.');
         } catch (err) {
             console.error('Error parsing FIREBASE_SERVICE_ACCOUNT:', err.message);
         }
@@ -40,9 +40,9 @@ if (!admin.apps.length) {
             admin.initializeApp({
                 credential: admin.credential.cert(serviceAccount)
             });
-            console.log('Firebase initialized via local key file.');
+            console.log('Firebase Admin initialized via local service account key.');
         } catch (err) {
-            console.warn('FIREBASE_SERVICE_ACCOUNT env and serviceAccountKey.json missing.');
+            console.warn('FIREBASE_SERVICE_ACCOUNT environment variable and serviceAccountKey.json missing.');
         }
     }
 }
@@ -51,36 +51,41 @@ const db = admin.apps.length ? admin.firestore() : null;
 const CALL_LOGS_COLLECTION = 'call_logs';
 
 /**
- * Paystack Bank/Momo Code Resolver for Ghana Telecoms
+ * Standardize phone numbers into clean digits (e.g., 0247946116)
  */
-function getPaystackBankCode(phone) {
-    const cleanNumber = phone.replace(/[^0-9]/g, '');
-    let localNumber = cleanNumber;
-    
-    if (cleanNumber.startsWith('233')) {
-        localNumber = '0' + cleanNumber.substring(3);
+function normalizePhoneNumber(phone) {
+    if (!phone) return '';
+    let clean = phone.replace(/[^0-9]/g, '');
+    if (clean.startsWith('233')) {
+        clean = '0' + clean.substring(3);
     }
-
-    const prefix = localNumber.substring(0, 3);
-
-    if (['024', '054', '055', '059', '025', '053'].includes(prefix)) {
-        return { bankCode: 'MTL', carrier: 'MTN Ghana', accountNumber: localNumber };
-    }
-    if (['020', '050'].includes(prefix)) {
-        return { bankCode: 'VOD', carrier: 'Telecel Ghana', accountNumber: localNumber };
-    }
-    if (['027', '057', '026', '056'].includes(prefix)) {
-        return { bankCode: 'ATL', carrier: 'AT Ghana', accountNumber: localNumber };
-    }
-    if (['023'].includes(prefix)) {
-        return { bankCode: 'GLO', carrier: 'Glo Ghana', accountNumber: localNumber };
-    }
-
-    return { bankCode: 'MTL', carrier: 'MTN Ghana', accountNumber: localNumber };
+    return clean;
 }
 
 /**
- * Paystack Account Resolution API Call
+ * Paystack Bank/Momo Code Resolver for Ghana Telecom Networks
+ */
+function getPaystackBankCode(cleanPhone) {
+    const prefix = cleanPhone.substring(0, 3);
+
+    if (['024', '054', '055', '059', '025', '053'].includes(prefix)) {
+        return { bankCode: 'MTL', carrier: 'MTN Ghana', accountNumber: cleanPhone };
+    }
+    if (['020', '050'].includes(prefix)) {
+        return { bankCode: 'VOD', carrier: 'Telecel Ghana', accountNumber: cleanPhone };
+    }
+    if (['027', '057', '026', '056'].includes(prefix)) {
+        return { bankCode: 'ATL', carrier: 'AT Ghana', accountNumber: cleanPhone };
+    }
+    if (['023'].includes(prefix)) {
+        return { bankCode: 'GLO', carrier: 'Glo Ghana', accountNumber: cleanPhone };
+    }
+
+    return { bankCode: 'MTL', carrier: 'Mobile Network', accountNumber: cleanPhone };
+}
+
+/**
+ * Verify phone account holder using Paystack Account Resolution API
  */
 function verifyNumberWithPaystack(accountNumber, bankCode) {
     return new Promise((resolve) => {
@@ -107,7 +112,7 @@ function verifyNumberWithPaystack(accountNumber, bankCode) {
             res.on('end', () => {
                 try {
                     const parsed = JSON.parse(data);
-                    if (parsed.status && parsed.data) {
+                    if (parsed.status && parsed.data && parsed.data.account_name) {
                         resolve(parsed.data.account_name);
                     } else {
                         resolve(null);
@@ -128,136 +133,129 @@ function verifyNumberWithPaystack(accountNumber, bankCode) {
 }
 
 /**
- * GET Handler: Fetch Call Logs from Firestore (with fallbacks)
+ * GET Handler: Query real call history for the exact entered phone number
  */
 async function handleGetCallLogs(req, res) {
-    const phoneNumber = req.query.phoneNumber || req.query.targetPhone || '0247946116';
-    const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
-    const { carrier } = getPaystackBankCode(cleanPhone);
-
-    const logs = [];
-
-    if (db) {
-        try {
-            const snapshot = await db.collection(CALL_LOGS_COLLECTION).get();
-            snapshot.forEach(doc => {
-                const data = doc.data();
-                // Match either targetPhone or phoneNumber
-                if (data.targetPhone === cleanPhone || data.phoneNumber === cleanPhone || !phoneNumber) {
-                    logs.push({
-                        id: doc.id,
-                        contactName: data.contactName || 'Subscriber (' + cleanPhone + ')',
-                        phoneNumber: data.phoneNumber || cleanPhone,
-                        type: data.type || 'incoming',
-                        timestamp: data.timestamp || new Date().toISOString(),
-                        durationSec: data.durationSec || 45,
-                        carrier: data.carrier || carrier,
-                        paystackVerified: Boolean(data.paystackVerified)
-                    });
-                }
-            });
-        } catch (error) {
-            console.error('Firestore Read Error:', error.message);
-        }
+    if (!db) {
+        return res.status(500).json({ 
+            status: 'error',
+            message: 'Database unavailable. Please set FIREBASE_SERVICE_ACCOUNT in your Vercel Environment Variables.' 
+        });
     }
 
-    // Fallback seed data if database has no entries for this number yet
-    if (logs.length === 0) {
-        const now = Date.now();
-        logs.push(
-            {
-                id: 'demo-log-1',
-                contactName: 'Abdul Razak (Verified)',
-                phoneNumber: cleanPhone,
-                type: 'incoming',
-                timestamp: new Date(now - 1000 * 60 * 15).toISOString(),
-                durationSec: 142,
-                carrier: carrier,
-                paystackVerified: true
-            },
-            {
-                id: 'demo-log-2',
-                contactName: 'Data Express Support',
-                phoneNumber: cleanPhone,
-                type: 'outgoing',
-                timestamp: new Date(now - 1000 * 60 * 180).toISOString(),
-                durationSec: 88,
-                carrier: carrier,
-                paystackVerified: true
-            },
-            {
-                id: 'demo-log-3',
-                contactName: 'Inquiry Service',
-                phoneNumber: cleanPhone,
-                type: 'missed',
-                timestamp: new Date(now - 1000 * 60 * 1440).toISOString(),
-                durationSec: 0,
-                carrier: carrier,
-                paystackVerified: false
+    const inputPhone = req.query.phoneNumber || req.query.targetPhone;
+    if (!inputPhone) {
+        return res.status(400).json({ status: 'error', message: 'Query parameter "phoneNumber" is required.' });
+    }
+
+    const cleanTarget = normalizePhoneNumber(inputPhone);
+    const daysLimit = parseInt(req.query.days || '90', 10);
+    const cutoffDate = new Date(Date.now() - daysLimit * 24 * 60 * 60 * 1000).toISOString();
+
+    try {
+        // Query Firestore specifically for records belonging ONLY to this target number
+        const snapshot = await db.collection(CALL_LOGS_COLLECTION)
+            .where('targetPhone', '==', cleanTarget)
+            .get();
+
+        const logs = [];
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            const logTimestamp = data.timestamp || new Date().toISOString();
+
+            // Filter for the last 30/90 days window
+            if (logTimestamp >= cutoffDate) {
+                logs.push({
+                    id: doc.id,
+                    contactName: data.contactName || 'Subscriber (' + cleanTarget + ')',
+                    phoneNumber: data.phoneNumber || cleanTarget,
+                    type: data.type || 'incoming',
+                    timestamp: logTimestamp,
+                    durationSec: data.durationSec || 0,
+                    carrier: data.carrier || 'Mobile Network',
+                    paystackVerified: Boolean(data.paystackVerified)
+                });
             }
-        );
+        });
+
+        // Sort real logs newest first
+        logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+        return res.status(200).json({
+            status: 'success',
+            targetPhone: cleanTarget,
+            days: daysLimit,
+            count: logs.length,
+            logs: logs
+        });
+
+    } catch (error) {
+        console.error('Firestore Read Error:', error);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Firestore Query Error: ' + error.message
+        });
     }
-
-    logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-    return res.status(200).json({
-        status: 'success',
-        targetPhone: cleanPhone,
-        count: logs.length,
-        logs: logs
-    });
 }
 
 /**
- * POST Handler: Save Call Log to Firestore
+ * POST Handler: Store real call log entry sent from client device or API sync
  */
 async function handlePostCallLog(req, res) {
+    if (!db) {
+        return res.status(500).json({ 
+            status: 'error',
+            message: 'Database unavailable. Please set FIREBASE_SERVICE_ACCOUNT in your Vercel Environment Variables.' 
+        });
+    }
+
     const { targetPhone, contactName, phoneNumber, type, durationSec, timestamp } = req.body;
 
     if (!targetPhone) {
         return res.status(400).json({ status: 'error', message: 'Field "targetPhone" is required.' });
     }
 
-    const cleanTarget = targetPhone.replace(/[^0-9]/g, '');
+    const cleanTarget = normalizePhoneNumber(targetPhone);
+    const cleanCallerPhone = normalizePhoneNumber(phoneNumber || targetPhone);
     const { bankCode, carrier, accountNumber } = getPaystackBankCode(cleanTarget);
 
+    // Live verification via Paystack API
     let verifiedName = await verifyNumberWithPaystack(accountNumber, bankCode);
-    const finalContactName = verifiedName || contactName || 'Subscriber (' + cleanTarget + ')';
+    const finalContactName = verifiedName || contactName || ('Subscriber (' + cleanTarget + ')');
 
     const newLogItem = {
         targetPhone: cleanTarget,
         contactName: finalContactName,
-        phoneNumber: phoneNumber || cleanTarget,
+        phoneNumber: cleanCallerPhone,
         type: type || 'incoming',
         durationSec: parseInt(durationSec || 0, 10),
         timestamp: timestamp || new Date().toISOString(),
         carrier: carrier,
         paystackVerified: Boolean(verifiedName),
-        createdAt: new Date().toISOString()
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
     };
 
-    let docId = 'temp-' + Date.now();
+    try {
+        const docRef = await db.collection(CALL_LOGS_COLLECTION).add(newLogItem);
 
-    if (db) {
-        try {
-            const docRef = await db.collection(CALL_LOGS_COLLECTION).add({
+        return res.status(201).json({
+            status: 'success',
+            id: docRef.id,
+            log: {
                 ...newLogItem,
-                createdAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-            docId = docRef.id;
-        } catch (error) {
-            console.error('Firestore Write Error:', error.message);
-        }
+                createdAt: new Date().toISOString()
+            }
+        });
+    } catch (error) {
+        console.error('Firestore Write Error:', error);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Firestore Save Error: ' + error.message
+        });
     }
-
-    return res.status(201).json({
-        status: 'success',
-        id: docId,
-        log: newLogItem
-    });
 }
 
-// 3. Catch-All Route Handling
+// Catch-All Routing Rule
 app.all('*', (req, res) => {
     const urlPath = req.path.toLowerCase();
     const method = req.method.toUpperCase();
@@ -265,7 +263,7 @@ app.all('*', (req, res) => {
     if (urlPath.includes('/health')) {
         return res.status(200).json({
             status: 'ok',
-            service: 'CallTrace Paystack & Firebase Backend',
+            service: 'CallTrace Paystack & Firebase Cloud Backend',
             paystackKeyConfigured: Boolean(process.env.PAYSTACK_SECRET_KEY),
             firebaseConfigured: Boolean(db),
             timestamp: new Date().toISOString()
@@ -273,12 +271,8 @@ app.all('*', (req, res) => {
     }
 
     if (urlPath.endsWith('/call-logs') || urlPath.includes('/call-logs')) {
-        if (method === 'GET') {
-            return handleGetCallLogs(req, res);
-        }
-        if (method === 'POST') {
-            return handlePostCallLog(req, res);
-        }
+        if (method === 'GET') return handleGetCallLogs(req, res);
+        if (method === 'POST') return handlePostCallLog(req, res);
     }
 
     return res.status(404).json({
