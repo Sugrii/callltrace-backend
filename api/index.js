@@ -1,11 +1,10 @@
 const express = require('express');
-const cors = require('cors');
 const admin = require('firebase-admin');
 const https = require('https');
 
 const app = express();
 
-// 1. Full CORS Preflight & Request Handling
+// 1. Explicit CORS Headers & Preflight Handling
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -23,8 +22,8 @@ app.use(express.json());
 if (!admin.apps.length) {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         try {
-            const rawKey = process.env.FIREBASE_SERVICE_ACCOUNT;
-            const parsedServiceAccount = rawKey.trim().startsWith('{')
+            const rawKey = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+            const parsedServiceAccount = rawKey.startsWith('{')
                 ? JSON.parse(rawKey)
                 : JSON.parse(Buffer.from(rawKey, 'base64').toString('utf8'));
 
@@ -90,7 +89,6 @@ function verifyNumberWithPaystack(accountNumber, bankCode) {
         const paystackSecretKey = process.env.PAYSTACK_SECRET_KEY;
         
         if (!paystackSecretKey) {
-            console.warn('PAYSTACK_SECRET_KEY not configured. Falling back to local prefix resolver.');
             return resolve(null);
         }
 
@@ -132,18 +130,18 @@ function verifyNumberWithPaystack(accountNumber, bankCode) {
 }
 
 /**
- * Controller: Get Call Logs
+ * GET Handler: Fetch Call Logs from Firestore
  */
-const handleGetCallLogs = async (req, res) => {
+async function handleGetCallLogs(req, res) {
     if (!db) {
         return res.status(500).json({ 
             status: 'error',
-            message: 'Database connection failed. Ensure FIREBASE_SERVICE_ACCOUNT environment variable is set in Vercel.' 
+            message: 'Database connection failed. FIREBASE_SERVICE_ACCOUNT environment variable is missing or invalid in Vercel.' 
         });
     }
 
     try {
-        const { phoneNumber, startDate, endDate } = req.query;
+        const phoneNumber = req.query.phoneNumber || req.query.targetPhone;
 
         if (!phoneNumber) {
             return res.status(400).json({ status: 'error', message: 'Query parameter "phoneNumber" is required.' });
@@ -151,15 +149,8 @@ const handleGetCallLogs = async (req, res) => {
 
         const cleanPhone = phoneNumber.replace(/[^0-9+]/g, '');
 
-        // Default to past 30 days window
-        const end = endDate ? new Date(endDate) : new Date();
-        const start = startDate ? new Date(startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-
         const snapshot = await db.collection(CALL_LOGS_COLLECTION)
             .where('targetPhone', '==', cleanPhone)
-            .where('timestamp', '>=', start.toISOString())
-            .where('timestamp', '<=', end.toISOString())
-            .orderBy('timestamp', 'desc')
             .get();
 
         const logs = [];
@@ -170,11 +161,15 @@ const handleGetCallLogs = async (req, res) => {
                 contactName: data.contactName || 'Unknown Contact',
                 phoneNumber: data.phoneNumber || cleanPhone,
                 type: data.type || 'incoming',
-                timestamp: data.timestamp,
+                timestamp: data.timestamp || new Date().toISOString(),
                 durationSec: data.durationSec || 0,
-                carrier: data.carrier || 'Mobile Network'
+                carrier: data.carrier || 'Mobile Network',
+                paystackVerified: Boolean(data.paystackVerified)
             });
         });
+
+        // Sort descending by timestamp in JavaScript to avoid composite index requirements
+        logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
         return res.status(200).json({
             status: 'success',
@@ -190,16 +185,16 @@ const handleGetCallLogs = async (req, res) => {
             message: 'Firestore Query Error: ' + error.message
         });
     }
-};
+}
 
 /**
- * Controller: Post Call Log with Paystack Account Name Verification
+ * POST Handler: Save Call Log to Firestore
  */
-const handlePostCallLog = async (req, res) => {
+async function handlePostCallLog(req, res) {
     if (!db) {
         return res.status(500).json({ 
             status: 'error',
-            message: 'Database connection failed. Ensure FIREBASE_SERVICE_ACCOUNT environment variable is set in Vercel.' 
+            message: 'Database connection failed. FIREBASE_SERVICE_ACCOUNT environment variable is missing or invalid in Vercel.' 
         });
     }
 
@@ -213,7 +208,7 @@ const handlePostCallLog = async (req, res) => {
         const cleanTarget = targetPhone.replace(/[^0-9+]/g, '');
         const { bankCode, carrier, accountNumber } = getPaystackBankCode(cleanTarget);
 
-        // Verify contact name live with Paystack API if key is present
+        // Verify account name with Paystack API
         let verifiedName = await verifyNumberWithPaystack(accountNumber, bankCode);
         const finalContactName = verifiedName || contactName || 'Subscriber (' + cleanTarget + ')';
 
@@ -244,22 +239,37 @@ const handlePostCallLog = async (req, res) => {
             message: 'Firestore Save Error: ' + error.message
         });
     }
-};
+}
 
-// Route Registrations for Vercel
-app.get('/call-logs', handleGetCallLogs);
-app.get('/api/call-logs', handleGetCallLogs);
+// 3. Catch-All Route Handling (Resolves Vercel Rewrites 404 issues)
+app.all('*', (req, res) => {
+    const urlPath = req.path.toLowerCase();
+    const method = req.method.toUpperCase();
 
-app.post('/call-logs', handlePostCallLog);
-app.post('/api/call-logs', handlePostCallLog);
+    // Health check endpoint
+    if (urlPath.includes('/health')) {
+        return res.status(200).json({
+            status: 'ok',
+            service: 'CallTrace Paystack & Firebase Backend',
+            paystackKeyConfigured: Boolean(process.env.PAYSTACK_SECRET_KEY),
+            firebaseConfigured: Boolean(db),
+            timestamp: new Date().toISOString()
+        });
+    }
 
-app.get(['/health', '/api/health'], (req, res) => {
-    res.status(200).json({ 
-        status: 'ok', 
-        service: 'CallTrace Paystack & Firebase Backend',
-        paystackKeyConfigured: Boolean(process.env.PAYSTACK_SECRET_KEY),
-        firebaseConfigured: Boolean(db),
-        timestamp: new Date().toISOString()
+    // Call logs endpoints
+    if (urlPath.endsWith('/call-logs') || urlPath.includes('/call-logs')) {
+        if (method === 'GET') {
+            return handleGetCallLogs(req, res);
+        }
+        if (method === 'POST') {
+            return handlePostCallLog(req, res);
+        }
+    }
+
+    return res.status(404).json({
+        status: 'error',
+        message: `Route ${req.method} ${req.path} not found.`
     });
 });
 
